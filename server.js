@@ -9,7 +9,6 @@ const validator = require('validator');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-
 const app = express();
 
 // Middleware
@@ -444,7 +443,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
   try {
     const user = await User.findOne({ email }).select('+otp +otpExpires');
-    if (!user) {
+    if (!user || user.otp !== otp || user.otpExpires < Date.now()) {
       return res.status(400).json({ 
         success: false, 
         error: 'Invalid or expired OTP',
