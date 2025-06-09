@@ -8,7 +8,8 @@ const jwt = require('jsonwebtoken');
 const validator = require('validator');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
+const fs = require('fs').promises;
+const fsSync = require('fs');
 const app = express();
 
 // Middleware
@@ -19,12 +20,35 @@ app.use(cors({
   credentials: true
 }));
 
+// Constants for file storage
+const uploadsDir = 'uploads/';
+const encryptionKey = process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex'); // Fallback to random key if not set
+const algorithm = 'aes-256-cbc';
+
+// Ensure upload directory exists
+if (!fsSync.existsSync(uploadsDir)) {
+  fsSync.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// Encryption/Decryption functions
+function encryptBuffer(buffer) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(algorithm, Buffer.from(encryptionKey, 'hex'), iv);
+  const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
+  return { iv, encrypted };
+}
+
+function decryptBuffer(encryptedBufferWithIv) {
+  const iv = encryptedBufferWithIv.slice(0, 16);
+  const encryptedData = encryptedBufferWithIv.slice(16);
+  const decipher = crypto.createDecipheriv(algorithm, Buffer.from(encryptionKey, 'hex'), iv);
+  return Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+}
+
 // Enhanced Multer config for file uploads with limits
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadDir = 'uploads/';
-    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-    cb(null, uploadDir);
+    cb(null, uploadsDir);
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
@@ -455,9 +479,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { 
       expiresIn: '1h' 
     });
-    // const refreshToken = jwt.sign({ id: user._id }, process.env.JWT_REFRESH_SECRET, {
-    //   expiresIn: '7d'
-    // });
 
     // Clear OTP
     user.otp = undefined;
@@ -468,7 +489,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     res.json({ 
       success: true, 
       token,
-      
       user: {
         id: user._id,
         name: user.name,
@@ -572,9 +592,14 @@ app.get('/api/files/list', verifyToken, async (req, res) => {
   }
 });
 
-// File upload with enhanced error handling
+// File upload with encryption
+// File upload with encryption
+// File upload with encryption
 app.post('/api/files/upload', verifyToken, upload.single('file'), async (req, res) => {
   try {
+    // Default to true if not specified (security first approach)
+    const encrypt = req.body.encrypt !== 'false';
+    
     if (!req.file) {
       return res.status(400).json({ 
         success: false, 
@@ -583,25 +608,49 @@ app.post('/api/files/upload', verifyToken, upload.single('file'), async (req, re
       });
     }
 
+    const tempPath = req.file.path;
+    const originalName = req.file.originalname;
+    const mimeType = req.file.mimetype;
+    const fileSize = req.file.size;
+
+    const fileBuffer = await fs.readFile(tempPath);
+
+    let finalBuffer;
+    let uniqueFilename;
+    if (encrypt) {
+      const { iv, encrypted } = encryptBuffer(fileBuffer);
+      finalBuffer = Buffer.concat([iv, encrypted]);
+      uniqueFilename = `${crypto.randomBytes(16).toString('hex')}.encrypted`;
+    } else {
+      finalBuffer = fileBuffer;
+      uniqueFilename = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${path.extname(originalName)}`;
+    }
+
+    const savePath = path.join(uploadsDir, uniqueFilename);
+    await fs.writeFile(savePath, finalBuffer);
+    await fs.unlink(tempPath);
+
     const newFile = await File.create({
       userId: req.user.id,
-      originalName: req.file.originalname,
-      filename: req.file.filename,
-      size: req.file.size,
-      mimeType: req.file.mimetype
+      originalName: originalName,
+      filename: uniqueFilename,
+      size: fileSize,
+      uploadDate: new Date(),
+      encrypted: encrypt, // This will now match the actual encryption status
+      mimeType: mimeType,
     });
 
     res.json({ 
       success: true, 
       file: newFile,
-      message: 'File uploaded successfully'
+      message: encrypt ? 'File uploaded and encrypted successfully' : 'File uploaded successfully',
+      encrypted: encrypt
     });
   } catch (err) {
     console.error('Upload error:', err);
-    
-    // Clean up the uploaded file if database operation failed
+
     if (req.file) {
-      fs.unlink(path.join('uploads', req.file.filename), () => {});
+      await fs.unlink(req.file.path).catch(unlinkErr => console.error('Failed to remove temp file:', unlinkErr));
     }
 
     if (err.code === 'LIMIT_FILE_SIZE') {
@@ -615,12 +664,13 @@ app.post('/api/files/upload', verifyToken, upload.single('file'), async (req, re
     res.status(500).json({ 
       success: false, 
       error: 'File upload failed',
-      code: 'UPLOAD_ERROR'
+      code: 'UPLOAD_ERROR',
+      details: err.message
     });
   }
 });
 
-// File download endpoint
+// File download with decryption
 app.get('/api/files/download/:id', verifyToken, async (req, res) => {
   try {
     const file = await File.findOne({ 
@@ -636,9 +686,12 @@ app.get('/api/files/download/:id', verifyToken, async (req, res) => {
       });
     }
 
-    const filePath = path.join('uploads', file.filename);
+    const filePath = path.join(uploadsDir, file.filename);
     
-    if (!fs.existsSync(filePath)) {
+    try {
+      await fs.access(filePath);
+    } catch (accessErr) {
+      console.error('File access error:', accessErr);
       return res.status(404).json({ 
         success: false, 
         error: 'File not found on server',
@@ -646,7 +699,37 @@ app.get('/api/files/download/:id', verifyToken, async (req, res) => {
       });
     }
 
-    res.download(filePath, file.originalName);
+    if (file.encrypted) {
+      try {
+        const encryptedBufferWithIv = await fs.readFile(filePath);
+        const decryptedBuffer = decryptBuffer(encryptedBufferWithIv);
+
+        res.writeHead(200, {
+          'Content-Type': file.mimeType || 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="${file.originalName}"`,
+          'Content-Length': decryptedBuffer.length
+        });
+        return res.end(decryptedBuffer);
+      } catch (decryptionError) {
+        console.error('Decryption failed:', decryptionError);
+        return res.status(500).json({ 
+          success: false, 
+          error: 'Failed to decrypt file',
+          code: 'DECRYPTION_ERROR'
+        });
+      }
+    } else {
+      res.download(filePath, file.originalName, (err) => {
+        if (err) {
+          console.error('Download error:', err);
+          res.status(500).json({ 
+            success: false, 
+            error: 'Failed to download file',
+            code: 'DOWNLOAD_FAILED'
+          });
+        }
+      });
+    }
   } catch (err) {
     console.error('Download error:', err);
     res.status(500).json({ 
@@ -673,10 +756,8 @@ app.delete('/api/files/delete/:id', verifyToken, async (req, res) => {
       });
     }
 
-    const filePath = path.join('uploads', file.filename);
-    fs.unlink(filePath, (err) => {
-      if (err) console.error('Failed to delete file from disk:', err);
-    });
+    const filePath = path.join(uploadsDir, file.filename);
+    await fs.unlink(filePath).catch(err => console.error('Failed to delete file from disk:', err));
 
     res.json({ 
       success: true, 
